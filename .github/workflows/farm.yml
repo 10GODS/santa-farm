@@ -8,7 +8,8 @@ on:
   schedule:
     - cron: '0 */6 * * *'
 jobs:
-  shard:
+  farm:
+    name: farm shard
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -25,15 +26,70 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: python farm_worker.py
+      - name: stage output
+        run: |
+          mkdir -p art
+          cp /tmp/farm_work/wins.json art/ 2>/dev/null || echo '{}' > art/wins.json
+          cp /tmp/farm_work/out_*.txt art/ 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
           name: wins-${{ matrix.shard }}
-          path: wins.json
-      - name: report to webhook
-        if: env.SANTA_WEBHOOK != ''
+          path: art/
+
+  collect:
+    name: merge + publish wins
+    needs: farm
+    if: always()
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wins-*
+          path: all-wins
+          merge-multiple: true
+      - name: merge wins + R-lines
         run: |
-          curl -s -X POST "$SANTA_WEBHOOK_URL" -H 'Content-Type: application/json' \
-            --data-urlencode "wins@wins.json" -o /dev/null || true
-        env:
-          SANTA_WEBHOOK: ${{ secrets.SANTA_WEBHOOK_URL }}
-          SANTA_WEBHOOK_URL: ${{ secrets.SANTA_WEBHOOK_URL }}
+          mkdir -p farm_out
+          python3 - <<'PY'
+import json, glob, os
+wins = {}
+for f in glob.glob('all-wins/wins.json'):
+    pass
+for d in sorted(glob.glob('all-wins*')):
+    p = os.path.join(d, 'wins.json')
+    if os.path.exists(p):
+        try: wins.update(json.load(open(p)))
+        except Exception: pass
+json.dump(wins, open('farm_out/wins.json','w'), indent=1)
+print('total winning puzzles:', len(wins))
+# merge R-line candidate files
+with open('farm_out/cand_R.txt','w') as out:
+    for f in glob.glob('all-wins*/out_*.txt') + glob.glob('all-wins/*/out_*.txt'):
+        out.write(open(f).read())
+PY
+      - name: publish to farm-results branch
+        run: |
+          git config user.name "farm-bot"
+          git config user.email "farm@bot.local"
+          git checkout --orphan farm-results
+          git add -f farm_out/
+          python3 - <<'PY'
+import json
+try:
+    w = json.load(open('farm_out/wins.json'))
+except Exception:
+    w = {}
+with open('farm_out/wins.csv', 'w') as f:
+    f.write('id,length,program\n')
+    for pid, rec in w.items():
+        prog = rec['program'].replace('\r', '').replace('\n', ' ')
+        f.write('%s,%s,"%s"\n' % (pid, rec['length'], prog))
+print('wins.csv rows:', len(w))
+PY
+          git add -f farm_out/wins.csv farm_out/cand_R.txt 2>/dev/null || true
+          git commit -m "farm results $(date -u +%FT%TZ)" -q
+          git push -f https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} farm-results
+          echo "PUBLISHED to farm-results branch"
