@@ -45,51 +45,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
       - uses: actions/download-artifact@v4
         with:
           pattern: wins-*
           path: all-wins
           merge-multiple: true
-      - name: merge wins + R-lines
-        run: |
-          mkdir -p farm_out
-          python3 - <<'PY'
-import json, glob, os
-wins = {}
-for f in glob.glob('all-wins/wins.json'):
-    pass
-for d in sorted(glob.glob('all-wins*')):
-    p = os.path.join(d, 'wins.json')
-    if os.path.exists(p):
-        try: wins.update(json.load(open(p)))
-        except Exception: pass
-json.dump(wins, open('farm_out/wins.json','w'), indent=1)
-print('total winning puzzles:', len(wins))
-# merge R-line candidate files
-with open('farm_out/cand_R.txt','w') as out:
-    for f in glob.glob('all-wins*/out_*.txt') + glob.glob('all-wins/*/out_*.txt'):
-        out.write(open(f).read())
-PY
+      - name: merge wins
+        run: python farm_collect.py
       - name: publish to farm-results branch
         run: |
           git config user.name "farm-bot"
           git config user.email "farm@bot.local"
           git checkout --orphan farm-results
           git add -f farm_out/
-          python3 - <<'PY'
-import json
-try:
-    w = json.load(open('farm_out/wins.json'))
-except Exception:
-    w = {}
-with open('farm_out/wins.csv', 'w') as f:
-    f.write('id,length,program\n')
-    for pid, rec in w.items():
-        prog = rec['program'].replace('\r', '').replace('\n', ' ')
-        f.write('%s,%s,"%s"\n' % (pid, rec['length'], prog))
-print('wins.csv rows:', len(w))
-PY
-          git add -f farm_out/wins.csv farm_out/cand_R.txt 2>/dev/null || true
           git commit -m "farm results $(date -u +%FT%TZ)" -q
-          git push -f https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} farm-results
-          echo "PUBLISHED to farm-results branch"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}" farm-results
+          echo PUBLISHED to farm-results branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
