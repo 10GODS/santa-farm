@@ -23,10 +23,10 @@ with open("farm_out/cand_R.txt", "w") as out:
         except Exception:
             pass
 
-# wins.csv for the databank importer
+# wins.csv for the databank importer (program = JSON list, string ops)
 with open("farm_out/wins.csv", "w") as f:
     f.write("id,length,program\n")
-    for pid, rec in wins.items():
-        prog = rec["program"].replace("\r", "").replace("\n", " ")
-        f.write('%s,%s,"%s"\n' % (pid, rec["length"], prog))
+    for pid, prog in wins.items():
+        js = json.dumps(prog, separators=(",", ":"))
+        f.write('%s,%d,"%s"\n' % (pid, len(prog), js.replace('"', '""')))
 print("wins.csv rows:", len(wins))
