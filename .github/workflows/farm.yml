@@ -1,0 +1,39 @@
+name: santa-setwalk-farm
+on:
+  workflow_dispatch:
+    inputs:
+      nshard: { description: 'shards', default: '20', required: false }
+      secs: { description: 'secs/puzzle', default: '45', required: false }
+      seed: { description: 'seed base', default: '777000', required: false }
+  schedule:
+    - cron: '0 */6 * * *'
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    env:
+      SHARD: ${{ matrix.shard }}
+      NSHARD: ${{ github.event.inputs.nshard || '20' }}
+      SECS: ${{ github.event.inputs.secs || '45' }}
+      SEED: ${{ github.event.inputs.seed || '777000' }}
+      CAP: '1500'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: python farm_worker.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wins-${{ matrix.shard }}
+          path: wins.json
+      - name: report to webhook
+        if: env.SANTA_WEBHOOK != ''
+        run: |
+          curl -s -X POST "$SANTA_WEBHOOK_URL" -H 'Content-Type: application/json' \
+            --data-urlencode "wins@wins.json" -o /dev/null || true
+        env:
+          SANTA_WEBHOOK: ${{ secrets.SANTA_WEBHOOK_URL }}
+          SANTA_WEBHOOK_URL: ${{ secrets.SANTA_WEBHOOK_URL }}
