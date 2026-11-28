@@ -1,0 +1,94 @@
+name: santa-setwalk-farm
+on:
+  workflow_dispatch:
+    inputs:
+      nshard: { description: 'shards', default: '20', required: false }
+      secs: { description: 'secs/puzzle', default: '45', required: false }
+      seed: { description: 'seed base', default: '777000', required: false }
+  schedule:
+    - cron: '0 */6 * * *'
+jobs:
+  farm:
+    name: farm shard
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    env:
+      SHARD: ${{ matrix.shard }}
+      NSHARD: ${{ github.event.inputs.nshard || '20' }}
+      SECS: ${{ github.event.inputs.secs || '45' }}
+      SEED: ${{ github.event.inputs.seed || '777000' }}
+      CAP: '1500'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: install ortools
+        run: pip install -q ortools
+      - run: python farm_worker.py
+      - name: our CP-SAT deep-closure engine (own solver)
+        run: |
+          python farm_cpsat.py --shard ${{ matrix.shard }} --nshard 20 \
+            --secs ${{ github.event.inputs.secs || '30' }} --workers 4 \
+            --extra 8000 --budget 2400 --out cpsat_wins.json || true
+      - name: merge cpsat wins into artifact
+        run: |
+          python - <<'PY'
+          import json, os
+          base = {}
+          if os.path.exists("wins.json"):
+              try: base = json.load(open("wins.json"))
+              except Exception: base = {}
+          if os.path.exists("cpsat_wins.json"):
+              try:
+                  cw = json.load(open("cpsat_wins.json"))
+              except Exception:
+                  cw = {}
+              for k, v in cw.items():
+                  if k not in base or len(v) < len(base[k]):
+                      base[k] = v
+              print("cpsat wins merged:", len(cw))
+          json.dump(base, open("wins.json", "w"))
+          PY
+      - name: stage output
+        run: |
+          mkdir -p art
+          cp wins.json art/ 2>/dev/null || echo '{}' > art/wins.json
+          cp out_*.txt art/ 2>/dev/null || true
+          cp cpsat_wins_certs.json art/ 2>/dev/null || echo '{}' > art/certs.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wins-${{ matrix.shard }}
+          path: art/
+
+  collect:
+    name: merge + publish wins
+    needs: farm
+    if: always()
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wins-*
+          path: all-wins
+          merge-multiple: true
+      - name: merge wins
+        run: python farm_collect.py
+      - name: publish to farm-results branch
+        run: |
+          git config user.name "farm-bot"
+          git config user.email "farm@bot.local"
+          git checkout --orphan farm-results
+          git add -f farm_out/
+          git commit -m "farm results $(date -u +%FT%TZ)" -q
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}" farm-results
+          echo PUBLISHED to farm-results branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
