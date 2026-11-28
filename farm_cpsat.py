@@ -64,9 +64,30 @@ def replay_ok(sv, tg, L, R, prog):
 
 
 def expand(puzzle, recs, extra_cap):
-    """Level-1 closure + level-2 target-anchored routes. Returns recipe list."""
+    """Backward, target-anchored construction universe with SHARED-VALUE DETECTION.
+
+Why this shape: a CP-SAT run over the frontier's own value set (plus the full
+one-step closure of it) returned OPTIMAL == the incumbent length on every
+puzzle we measured, so nothing there can be improved. The only way out is a
+value the frontier never produced. We therefore work backward from targets:
+
+    t  =  y op d        (y intermediate, d any known value)
+
+and we look for the case where ONE y serves SEVERAL targets:
+
+    t1 = y + d1 ,  t2 = y + d2   =>  t1 - t2 = d1 - d2
+    t1 = y * d1 ,  t2 = y * d2   =>  t1*d2 = t2*d1
+
+Such a y is a genuinely new value with two consumers: it pays for itself only
+if it is reachable in ONE step from known values, otherwise it costs as much as
+it saves. We therefore require a one-step derivation for y and let CP-SAT trade
+the whole thing off against the incumbent's per-target chains.
+
+Returns a recipe list of (op, a, b, v).
+"""
     sv = puzzle["sv"]
     L = puzzle["L"]
+    svset = set(sv)
     values = set(sv)
     rec = []
     seen = set()
@@ -76,56 +97,298 @@ def expand(puzzle, recs, extra_cap):
         if r not in seen:
             seen.add(r)
             rec.append(r)
-    vals = sorted(values)
-    # level 1: fresh one-op values from known values
+    V0 = sorted(values)
+    vset = set(V0)
+
+    def prod1(v):
+        """one-step derivation of v from two known values, or None"""
+        if v in vset:
+            return None
+        for a in V0:
+            if a <= 0:
+                continue
+            if v - a in vset and v - a > 0:
+                return ("+", a, v - a)
+            if a <= v and v % a == 0 and a != v and (v // a) in vset:
+                return ("*", a, v // a)
+            if (v + a) in vset:
+                return ("-", v + a, a)
+            if a != 0 and (v * a) in vset:
+                return ("/", v * a, a)
+        return None
+
+    def prod2(v):
+        """two-step derivation: v = x op e, x produced in one step from known."""
+        if v in vset:
+            return None
+        for x in made1c:
+            for e in V0:
+                if e <= 0:
+                    continue
+                if x + e == v:
+                    return ("+", x, e)
+                if x - e == v and x > e:
+                    return ("-", x, e)
+                if x * e == v and v <= L:
+                    return ("*", x, e)
+                if e and x % e == 0 and x // e == v:
+                    return ("/", x, e)
+        return None
+
+    def prod_any(v):
+        return prod1(v) or prod2(v)
+
+    tgt = [t for t in puzzle["tg"] if t not in svset]
+    tgt_set = set(tgt)
+    n_new = 0
+    budget = extra_cap
+
+    # one-step values reachable from the frontier (used for two-step derivations)
+    made1c = {}
+    for i, a in enumerate(V0):
+        for b in V0[i:]:
+            for v, op in ((a + b, "+"), (a * b, "*"), (b - a if b > a else None, "-")):
+                if v is None or v > L or v in vset:
+                    continue
+                made1c.setdefault(v, (op, a, b))
+            if a and b % a == 0 and b != a:
+                v = b // a
+                if v not in vset:
+                    made1c.setdefault(v, ("/", b, a))
+        if len(made1c) > 40000:
+            break
+
+    # ---- SHARED INTERMEDIATE SEARCH (generalised) ---------------------------
+    # A fresh value y that serves TWO OR MORE targets is the only structural
+    # saving available: the incumbents pay one instruction per target, while a
+    # shared y pays ~one instruction and serves many targets.
+    #   t = y + d   =>  d = t - y        t = y - d  =>  d = y - t
+    #   t = y * d   =>  d = t / y        t = y / d  =>  d = y / t
+    # The partner d must itself be cheap to produce, otherwise sharing does not
+    # pay: we accept d in V0 (free, already in the frontier) or d with a
+    # two-step derivation, and we require y itself to have a <=2-step
+    # derivation. CP-SAT then decides whether the trade is actually worth it.
+    def partner_ok(d):
+        if d in vset:
+            return True
+        return prod_any(d) is not None
+
+    consumers = {}
+    for t1 in tgt:
+        for d in V0:
+            if d <= 0:
+                continue
+            cands = []
+            if t1 - d > 0:
+                cands.append(t1 - d)
+            if t1 + d <= L:
+                cands.append(t1 + d)
+            if t1 % d == 0:
+                cands.append(t1 // d)
+            if d % t1 == 0:
+                cands.append(d // t1)
+            for y in cands:
+                if y <= 0 or y > L or y in vset or y in tgt_set:
+                    continue
+                consumers.setdefault(y, []).append((t1, d))
+    shared = []
+    for y, lst in consumers.items():
+        ts = {}
+        for t1, d in lst:
+            if t1 in ts:
+                continue
+            d_add = t1 - y
+            d_sub = y - t1
+            d_mul = (t1 // y) if (y and t1 % y == 0) else None
+            d_div = (y // t1) if (t1 and y % t1 == 0) else None
+            legs = None
+            if d_add > 0 and partner_ok(d_add):
+                legs = [("+", y, d_add)]
+            elif d_sub > 0 and partner_ok(d_sub):
+                legs = [("-", y, d_sub)]
+            elif d_mul is not None and d_mul > 0 and partner_ok(d_mul):
+                legs = [("*", y, d_mul)]
+            elif d_div is not None and d_div > 0 and partner_ok(d_div):
+                legs = [("/", y, d_div)]
+            if legs:
+                ts[t1] = legs
+        if len(ts) < 2:
+            continue
+        pr = prod_any(y)
+        if pr is None:
+            continue
+        shared.append((y, ts, pr))
+        budget -= 1
+        if budget <= 0:
+            break
+    for y, ts, pr in shared:
+        op, a, b = pr
+        rec.append((op, a, b, y))
+        for t1, legs in ts.items():
+            for (lop, ly, ld) in legs:
+                rec.append((lop, ly, ld, t1))
+        vset.add(y)
+        n_new += 1
+
+    # ---- full one-step closure of the frontier's values ----------------------
+    # (kept: CP-SAT proved OPTIMAL==incumbent inside it, but it is still the
+    #  cheapest source of candidate recipes and it costs nothing to keep)
     level1 = {}
-    for i, a in enumerate(vals):
-        for b in vals[i:]:
+    for i, a in enumerate(V0):
+        for b in V0[i:]:
             s = a + b
-            if s <= L and s not in level1:
+            if s <= L and s not in level1 and s not in vset:
                 level1[s] = ("+", a, b)
             m = a * b
-            if m <= L and m not in level1:
+            if m <= L and m not in level1 and m not in vset:
                 level1[m] = ("*", a, b)
-            if b > a and (b - a) not in level1:
+            if b > a and (b - a) not in level1 and (b - a) not in vset:
                 level1[b - a] = ("-", b, a)
-            if a and b % a == 0 and b != a and (b // a) not in level1:
+            if a and b % a == 0 and b != a and (b // a) not in level1 and (b // a) not in vset:
                 level1[b // a] = ("/", b, a)
             if len(level1) >= extra_cap:
                 break
         if len(level1) >= extra_cap:
             break
     for v, (op, a, b) in level1.items():
-        r = (op, a, b, v)
-        if r not in seen:
-            seen.add(r)
-            rec.append(r)
-    values |= set(level1)
-    # level 2: target-anchored 2-step routes
-    uni = sorted(values)
-    for t in puzzle["tg"]:
-        if t in sv:
-            continue
-        for d in uni:
+        rec.append((op, a, b, v))
+        vset.add(v)
+    V1 = sorted(vset)
+    # two-step target anchors: t = y op d with y in the closed set
+    for t in tgt:
+        for d in V1:
             if d <= 0:
                 continue
-            cands = []
+            opts = []
+            if t > d and (t - d) in vset:
+                opts.append(("+", t - d, d))
+            if d > t and (d - t) in vset:
+                opts.append(("-", d - t, d))
+            if t % d == 0 and (t // d) in vset:
+                opts.append(("*", t // d, d))
+            if d % t == 0 and (d // t) in vset:
+                opts.append(("/", d // t, d))
+            for op, y, dd in opts:
+                rec.append((op, y, dd, t))
+                break
+
+    # ---- shared intermediates ------------------------------------------------
+    # map "value produced as t op d" so we can find a y used by >=2 targets
+    # additive family: t1 = y + d1 and t2 = y + d2  => d1 - d2 = t1 - t2
+    by_diff = {}
+    for t1 in tgt:
+        for d1 in V0:
+            diff = t1 - d1
+            by_diff.setdefault(diff, []).append((t1, d1))
+    shared_add = []
+    for diff, lst in by_diff.items():
+        if len(lst) < 2 or budget <= 0:
+            continue
+        # need two entries with different targets and same diff structure:
+        # t1 = y + d1, t2 = y + d2 -> (t1 - d1) == (t2 - d2)  and t1 != t2
+        seen_t = set()
+        for (t1, d1) in lst:
+            if t1 in seen_t:
+                continue
+            for (t2, d2) in lst:
+                if t2 == t1:
+                    continue
+                y = t1 - d1
+                if y != t2 - d2:
+                    continue
+                if y <= 0 or y > L or y in vset or y in tgt_set:
+                    continue
+                pr = prod1(y)
+                if pr is None:
+                    continue
+                shared_add.append((y, [(t1, d1), (t2, d2)], pr))
+                seen_t.add(t1)
+                budget -= 1
+                break
+    # multiplicative family: t1 = y * d1 and t2 = y * d2
+    by_ratio = {}
+    for t1 in tgt:
+        for d1 in V0:
+            r = t1 // d1 if d1 else 0
+            if d1 and t1 % d1 == 0:
+                by_ratio.setdefault(r, []).append((t1, d1))
+    shared_mul = []
+    for r, lst in by_ratio.items():
+        if len(lst) < 2 or budget <= 0:
+            continue
+        seen_t = set()
+        for (t1, d1) in lst:
+            if t1 in seen_t:
+                continue
+            for (t2, d2) in lst:
+                if t2 == t1:
+                    continue
+                y = t1 // d1
+                if y != t2 // d2:
+                    continue
+                if y <= 0 or y > L or y in vset or y in tgt_set:
+                    continue
+                pr = prod1(y)
+                if pr is None:
+                    continue
+                shared_mul.append((y, [(t1, d1), (t2, d2)], pr))
+                seen_t.add(t1)
+                budget -= 1
+                break
+
+    for y, legs, pr in shared_add:
+        op, a, b = pr
+        rec.append((op, a, b, y))
+        for t, d in legs:
+            rec.append(("+", y, d, t))
+        vset.add(y)
+        n_new += 1
+    for y, legs, pr in shared_mul:
+        op, a, b = pr
+        rec.append((op, a, b, y))
+        for t, d in legs:
+            rec.append(("*", y, d, t))
+        vset.add(y)
+        n_new += 1
+
+    # ---- single-target backward routes --------------------------------------
+    # t = y op d, with y produced in one step from known values.
+    # These are the depth-2 candidates that do not have a second consumer;
+    # they let CP-SAT replace a long per-target chain with a short one.
+    for t in tgt:
+        if budget <= 0:
+            break
+        for d in V0:
+            if d <= 0:
+                break
+            opts = []
             if t > d:
-                cands.append(("+", t - d, d))
-            if d > t and (d - t) in values:
-                cands.append(("-", d - t, d))
+                opts.append(("+", t - d, d))
+            if d > t:
+                opts.append(("-", d - t, d))
             if t % d == 0:
-                cands.append(("*", t // d, d))
+                opts.append(("*", t // d, d))
             if d % t == 0:
-                cands.append(("/", d // t, d))
-            for op, y, dd in cands:
-                if y > 0 and y in values:
-                    r = (op, y, dd, t)
-                    if r not in seen:
-                        seen.add(r)
-                        rec.append(r)
-                    break
-    return rec
+                opts.append(("/", d // t, d))
+            if t + d <= L:
+                opts.append(("-", t + d, d))
+            hit = None
+            for op, y, dd in opts:
+                if 0 < y <= L and y not in vset and y not in tgt_set:
+                    pr = prod1(y)
+                    if pr:
+                        hit = (op, y, dd, pr)
+                        break
+            if hit:
+                op, y, dd, pr = hit
+                pop, pa, pb = pr
+                rec.append((pop, pa, pb, y))
+                rec.append((op, y, dd, t))
+                vset.add(y)
+                n_new += 1
+                budget -= 1
+                break
+    return rec, n_new
 
 
 def schedule(selected, sel_recipe, sv, R, tg):
@@ -194,7 +457,7 @@ def solve(pid, puzzle, spec, secs, extra_cap, workers):
     R = puzzle["R"]
     n0 = spec["n0"]
     svset = set(sv)
-    recs = expand(puzzle, spec["rec"], extra_cap)
+    recs, n_new = expand(puzzle, spec["rec"], extra_cap)
     by_value = {}
     for op, a, b, v in recs:
         if v in svset:
