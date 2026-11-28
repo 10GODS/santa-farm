@@ -143,6 +143,29 @@ Returns a recipe list of (op, a, b, v).
     n_new = 0
     budget = extra_cap
 
+    def add_derivation(v, depth=0):
+        """Ensure v has at least one recipe in `rec`.
+
+        Recipes may reference operand values that were never themselves
+        produced (that happened with shared intermediates whose partner d was
+        only 'cheap to produce', not actually produced). The CP-SAT model then
+        failed with KeyError on x[operand] -> the whole puzzle was silently
+        dropped as 'no win'. This closure adds the missing derivations.
+        """
+        if depth > 3 or v in svset or v in vset:
+            return
+        pr = prod1(v) or prod2(v)
+        if pr is None:
+            return
+        op, a, b = pr
+        add_derivation(a, depth + 1)
+        add_derivation(b, depth + 1)
+        r = (op, a, b, v)
+        if r not in seen:
+            seen.add(r)
+            rec.append(r)
+        vset.add(v)
+
     # one-step values reachable from the frontier (used for two-step derivations)
     made1c = {}
     for i, a in enumerate(V0):
@@ -223,9 +246,12 @@ Returns a recipe list of (op, a, b, v).
             break
     for y, ts, pr in shared:
         op, a, b = pr
+        add_derivation(a)
+        add_derivation(b)
         rec.append((op, a, b, y))
         for t1, legs in ts.items():
             for (lop, ly, ld) in legs:
+                add_derivation(ld)
                 rec.append((lop, ly, ld, t1))
         vset.add(y)
         n_new += 1
@@ -382,6 +408,8 @@ Returns a recipe list of (op, a, b, v).
             if hit:
                 op, y, dd, pr = hit
                 pop, pa, pb = pr
+                add_derivation(pa)
+                add_derivation(pb)
                 rec.append((pop, pa, pb, y))
                 rec.append((op, y, dd, t))
                 vset.add(y)
@@ -450,7 +478,7 @@ def schedule(selected, sel_recipe, sv, R, tg):
     return prog
 
 
-def solve(pid, puzzle, spec, secs, extra_cap, workers):
+def solve(pid, puzzle, spec, secs, extra_cap, workers, hint=None):
     sv = puzzle["sv"]
     tg = puzzle["tg"]
     L = puzzle["L"]
@@ -467,14 +495,29 @@ def solve(pid, puzzle, spec, secs, extra_cap, workers):
         by_value.setdefault(v, []).append((op, a, b))
     need = [t for t in tg if t not in svset]
     if not need:
-        return None
+        return None, None
     for t in need:
         if t not in by_value:
-            return None
+            return None, None
+    # safety: drop recipes whose operands were never produced (would raise
+    # KeyError in the model and silently lose the whole puzzle)
+    for v in list(by_value):
+        keep = []
+        for r in by_value[v]:
+            op, a, b = r
+            if (a in svset or a in by_value) and (b in svset or b in by_value):
+                keep.append(r)
+        if keep:
+            by_value[v] = keep
+        else:
+            del by_value[v]
+    for t in need:
+        if t not in by_value:
+            return None, None
     m = cp_model.CpModel()
     values = sorted(by_value)
     if len(values) > 40000:
-        return None
+        return None, None
     x = {v: m.NewBoolVar(f"x{i}") for i, v in enumerate(values)}
     for t in need:
         m.Add(x[t] == 1)
@@ -498,15 +541,35 @@ def solve(pid, puzzle, spec, secs, extra_cap, workers):
                 if p not in svset:
                     m.Add(lvl[v] >= lvl[p] + 1).OnlyEnforceIf(y[(v, k)])
     m.Minimize(sum(x.values()))
+    if hint:
+        # Warm start from the incumbent program: CP-SAT then begins with a
+        # feasible n0-value solution instead of hunting for any feasible one.
+        # Without this the solver often returns a WORSE feasible solution than
+        # the incumbent (observed: proxy 79 vs incumbent 75) simply because it
+        # ran out of time before improving.
+        hv, hrec = hint
+        for v in hv:
+            if v in x:
+                m.AddHint(x[v], 1)
+        for (v, k) in y:
+            want = hrec.get(v)
+            if want is not None and by_value[v][k] == want:
+                m.AddHint(y[(v, k)], 1)
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(secs)
     solver.parameters.num_search_workers = workers
     st = solver.Solve(m)
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return None
+        return None, None
+    try:
+        bound = solver.BestObjectiveBound()
+    except Exception:
+        bound = None
     chosen = [v for v in values if solver.Value(x[v])]
+    proven = (st == cp_model.OPTIMAL) or (bound is not None and bound >= n0 - 1e-6)
     if len(chosen) >= n0:
-        return None
+        return None, {"status": solver.StatusName(st), "bound": bound, "obj": len(chosen),
+                      "proven_optimal": bool(proven), "universe": len(values)}
     sel_recipe = {}
     for v in chosen:
         picked = None
@@ -515,14 +578,49 @@ def solve(pid, puzzle, spec, secs, extra_cap, workers):
                 picked = (op, a, b)
                 break
         if picked is None:
-            return None
+            return None, None
         sel_recipe[v] = picked
+    cert = {"status": solver.StatusName(st), "bound": bound, "obj": len(chosen),
+            "proven_optimal": bool(proven), "universe": len(values)}
     prog = schedule(set(chosen), sel_recipe, sv, R, tg)
     if prog is None or len(prog) >= n0:
-        return None
+        cert["scheduled"] = None if prog is None else len(prog)
+        return None, cert
+    cert["scheduled"] = len(prog)
     if not replay_ok(sv, tg, L, R, prog):
-        return None
-    return prog
+        cert["replay_ok"] = False
+        return None, cert
+    cert["replay_ok"] = True
+    return prog, cert
+
+
+def best_program_hints(best, puzzles):
+    """value -> recipe map from the incumbent programs (for CP-SAT warm start).
+
+    The incumbent program already achieves n0 instructions, so hinting the
+    model with its values lets the search start INSIDE the incumbent's cost
+    instead of from scratch.
+    """
+    hints = {}
+    for pid, prog in best.items():
+        p = puzzles.get(pid)
+        if not p:
+            continue
+        regs = list(p["sv"]) + [None] * (p["R"] - len(p["sv"]))
+        vals = set()
+        rec = {}
+        for op, i, j, d in prog:
+            a, b = regs[i], regs[j]
+            if a is None or b is None:
+                break
+            if op == "/" and (b == 0 or a % b):
+                break
+            v = a + b if op == "+" else a - b if op == "-" else a * b if op == "*" else a // b
+            regs[d] = v
+            vals.add(v)
+            rec.setdefault(v, (op, a, b))
+        hints[pid] = (vals, rec)
+    return hints
 
 
 def main():
@@ -540,17 +638,30 @@ def main():
     with gzip.open(args.data, "rt", encoding="utf-8") as f:
         slim = json.load(f)
     puzzles = load_puzzles(args.puzzles)
+    best = {}
+    bpath = os.path.join(HERE, "data", "best.csv")
+    if os.path.exists(bpath):
+        import csv as _csv
+        for r in _csv.DictReader(open(bpath, newline="")):
+            best[r["id"]] = json.loads(r["program"])
+    hints = best_program_hints(best, puzzles)
     items = sorted(slim.items(), key=lambda kv: -kv[1]["n0"])
     items = [kv for i, kv in enumerate(items) if i % args.nshard == args.shard]
     wins = {}
+    certs = {}
     t0 = time.time()
     for pid, spec in items:
         if time.time() - t0 > args.budget:
             break
         try:
-            prog = solve(pid, puzzles[pid], spec, args.secs, args.extra, args.workers)
-        except Exception:
-            prog = None
+            prog, cert = solve(pid, puzzles[pid], spec, args.secs, args.extra, args.workers,
+                               hint=hints.get(pid))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            prog, cert = None, {"status": "EXC:" + type(e).__name__ + ":" + str(e)[:120]}
+        if cert:
+            certs[pid] = cert
         if prog:
             wins[pid] = prog
             print(f"{pid} WIN {len(prog)} (was {spec['n0']})", flush=True)
@@ -558,7 +669,11 @@ def main():
                 json.dump(wins, f)
     with open(args.out, "w") as f:
         json.dump(wins, f)
-    print(f"shard {args.shard}: {len(wins)} wins -> {args.out}", flush=True)
+    with open(args.out.replace(".json", "_certs.json"), "w") as f:
+        json.dump(certs, f)
+    nproven = sum(1 for c in certs.values() if c.get("proven_optimal"))
+    print(f"shard {args.shard}: {len(wins)} wins, {nproven}/{len(certs)} PROVEN-OPTIMAL -> {args.out}",
+          flush=True)
 
 
 if __name__ == "__main__":

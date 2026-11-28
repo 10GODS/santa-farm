@@ -57,6 +57,7 @@ jobs:
           mkdir -p art
           cp wins.json art/ 2>/dev/null || echo '{}' > art/wins.json
           cp out_*.txt art/ 2>/dev/null || true
+          cp cpsat_wins_certs.json art/ 2>/dev/null || echo '{}' > art/certs.json
       - uses: actions/upload-artifact@v4
         with:
           name: wins-${{ matrix.shard }}
