@@ -25,12 +25,38 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
+      - name: install ortools
+        run: pip install -q ortools
       - run: python farm_worker.py
+      - name: our CP-SAT deep-closure engine (own solver)
+        run: |
+          python farm_cpsat.py --shard ${{ matrix.shard }} --nshard 20 \
+            --secs ${{ github.event.inputs.secs || '30' }} --workers 4 \
+            --extra 8000 --budget 2400 --out cpsat_wins.json || true
+      - name: merge cpsat wins into artifact
+        run: |
+          python - <<'PY'
+          import json, os
+          base = {}
+          if os.path.exists("wins.json"):
+              try: base = json.load(open("wins.json"))
+              except Exception: base = {}
+          if os.path.exists("cpsat_wins.json"):
+              try:
+                  cw = json.load(open("cpsat_wins.json"))
+              except Exception:
+                  cw = {}
+              for k, v in cw.items():
+                  if k not in base or len(v) < len(base[k]):
+                      base[k] = v
+              print("cpsat wins merged:", len(cw))
+          json.dump(base, open("wins.json", "w"))
+          PY
       - name: stage output
         run: |
           mkdir -p art
-          cp /tmp/farm_work/wins.json art/ 2>/dev/null || echo '{}' > art/wins.json
-          cp /tmp/farm_work/out_*.txt art/ 2>/dev/null || true
+          cp wins.json art/ 2>/dev/null || echo '{}' > art/wins.json
+          cp out_*.txt art/ 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
           name: wins-${{ matrix.shard }}
